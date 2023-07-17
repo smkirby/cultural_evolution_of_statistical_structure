@@ -1,0 +1,472 @@
+---
+title: "Analysis for paper on cultural evolution of statistical structure"
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(reticulate)
+```
+
+```{python}
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from collections import defaultdict
+from math import log, log2
+```
+
+```{python}
+sns.set_theme()
+sns.set_context("notebook")
+plt.tight_layout(pad=3)
+```
+
+```{python}
+data = pd.read_csv("simon_game_data.csv")
+data["sentence_number"] = list(range(60))*66
+data
+```
+
+## Check for decrease in error (hallmark of iterated learning)
+
+```{python}
+sns.lineplot(data, x="generation", y="error", err_style="bars")
+plt.tight_layout(pad=3.5)
+plt.show()
+plt.savefig("error.png")
+plt.clf()
+```
+
+Very clear decrease in error.
+
+```{r, warning=FALSE}
+library(lme4)
+library(lmerTest)
+
+model <- lmer(data=py$data, error ~ generation + (1+generation|chain))
+summary(model)
+```
+
+## Functions to build n-gram entropy and ranked n-gram frequency data frames
+
+These work with either strings, or lists of strings. In the latter case, the relevant unit is the whole word, whereas in the former it is the character. Basically, we use strings if we want to examine, e.g. ngram frequencies of characters. The latter we would normally just use at the n=1 level to look at the ranked frequency distribution of individual words (as opposed to sequences of words)
+
+```{python}
+def ngram_table(data, generation, chain, n):
+    strings = data[(data["chain"] == chain) & (data["generation"] == generation)]["string"]
+    ngram_counts = defaultdict(int)
+    for s in strings:
+        for i in range(len(s) - (n - 1)):
+            ngram = s[i:i+n]
+            ngram_counts[str(ngram)] = ngram_counts[str(ngram)] + 1
+    return ngram_counts
+
+def ngram_entropy(ngram_counts):
+    total_count = float(sum(ngram_counts.values()))
+    entropy = 0.
+    for count in ngram_counts.values():
+        entropy -= count/total_count * log2(count/total_count)
+    return entropy
+
+
+def ngram_entropies(data, n):
+    generations = list(set(data["generation"]))
+    chains = list(set(data["chain"]))
+    data_dict = {'generation':[], 'chain':[], 'ngram_entropy':[], 'ngram_count':[], 'error':[]}
+    for c in chains:
+        for g in generations:
+            data_dict['generation'].append(g)
+            data_dict['chain'].append(c)
+            data_dict['ngram_entropy'].append(ngram_entropy(ngram_table(data, g, c, n)))
+            data_dict['ngram_count'].append(sum(ngram_table(data, g, c, n).values()))
+            data_dict['error'].append( data[(data["generation"]==g)&(data["chain"]==c)]["error"].mean())
+    return pd.DataFrame.from_dict(data_dict)    
+
+def ranked_ngram_frequencies(data, n):
+    generations = list(set(data["generation"]))
+    chains = list(set(data["chain"]))
+    data_dict = {'generation':[], 'chain':[], 'rank':[], 'count':[], 'log_rank':[], 'log_count':[]}
+    for c in chains:
+        for g in generations:
+            bg = sorted(list(ngram_table(data, g, c, n).values()), reverse=True)
+            for i in range(len(bg)):
+                data_dict['generation'].append(g)
+                data_dict['chain'].append(c)
+                data_dict['rank'].append(i)
+                data_dict['count'].append(bg[i])
+                data_dict['log_rank'].append(log(i + 1))
+                data_dict['log_count'].append(log(bg[i]))
+    return pd.DataFrame.from_dict(data_dict)    
+
+```
+
+## Functions to build a data frame with TPs instead of sequences
+
+This is mainly to process characters into TPs between characters, for using to segment the strings into word sets. If n=2, then this is done with bigrams essentially. So, it's looking at the probability of a character based on the previous character. If n=3, then it is looking at the probability of a character based on the previous two characters. Note that this means the length of the TPs is the string length minus n - 1.
+
+```{python}
+def transition_data(data, generation, chain, n):
+    ngrams = ngram_table(data, generation, chain, n)
+    smaller_grams = ngram_table(data, generation, chain, n - 1)
+    strings = data[(data["chain"] == chain) & (data["generation"] == generation)]["string"]
+    transitions_list = []
+    for string in strings:
+        transitions = []
+        for i in range(len(string) - (n - 1)):
+            transitions.append(ngrams[string[i:i+n]] / smaller_grams[string[i:i+(n-1)]])
+        transitions_list.append(transitions)
+    return transitions_list
+
+def transition_data_frame(data, n):
+    generations = list(set(data["generation"]))
+    chains = list(set(data["chain"]))
+    data_dict = {'generation':[], 'chain':[], 'sentence_number':[], 'position':[], 'transition_probability':[]}
+    for c in chains:
+        for g in generations:
+            td = transition_data(data, g, c, n)
+            for i in range(len(td)):
+                for j in range(len(td[i])): 
+                    data_dict['generation'].append(g)
+                    data_dict['chain'].append(c)
+                    data_dict['sentence_number'].append(i)
+                    data_dict['position'].append(j)
+                    data_dict['transition_probability'].append(td[i][j])
+    return pd.DataFrame.from_dict(data_dict)
+```
+
+## Cut up the sequences based on transitional probabilities and some chosen cutoff point.
+
+Now we can slice up the original strings of characters based on any particularly low transitional probabilities that we find, which indicate word boundaries. We're looking for dips in the TPs such that a TP at position n is lower by some cutoff ration than the TP at position n-1.
+
+The raios_df function creates a new data frame with the ratios between TPs at n and TPs and n+1. The idea is to be able to see the distribution of TP ratios in the random initial data and use this as a principled way of deciding where the cutoff should be for slicing up the sequences.
+
+```{python}
+def cut_sequences(data, td, generation, chain, n, cutoff):
+    strings = list(data[(data["chain"] == chain) & (data["generation"] == generation)]["string"])
+    transitions = td[(td["chain"] == chain) & (td["generation"] == generation)]
+    sentences = []
+    for i in range(len(strings)):
+        ts = list(transitions[transitions["sentence_number"] == i]["transition_probability"])
+        words = []
+        word = str(strings[i])[0:(n-1)]
+        for j in range(len(ts)):
+            if ts[j] < cutoff:
+                words.append(word)
+                word = ''
+            word += str(strings[i])[j+(n-1)]
+        words.append(word)
+        sentences.append(words)
+    return sentences
+
+
+def get_distribution_of_pairs_of_TPs(data, td, generation, chain, n):
+    ratios = []
+    strings = list(data[(data["chain"] == chain) & (data["generation"] == generation)]["string"])
+    transitions = td[(td["chain"] == chain) & (td["generation"] == generation)]
+    for i in range(len(strings)):
+        ts = list(transitions[transitions["sentence_number"] == i]["transition_probability"])
+        last_tp = ts[0]
+        for j in range(len(ts)-1):
+            ratios.append(ts[j+1]/last_tp)
+    return ratios
+
+def ratios_df(data, td, n):
+    generations = list(set(data["generation"]))
+    chains = list(set(data["chain"]))
+    data_dict = {'generation':[], 'chain':[], 'ratio':[]}
+    for c in chains:
+        for g in generations:
+            ratios=get_distribution_of_pairs_of_TPs(data, td, g, c, n)
+            for r in ratios:
+                data_dict['generation'].append(g)
+                data_dict['chain'].append(c)
+                data_dict['ratio'].append(r)
+    return pd.DataFrame.from_dict(data_dict)
+
+def cut_sequences_sliding(data, td, generation, chain, n, cutoff_ratio):
+    strings = list(data[(data["chain"] == chain) & (data["generation"] == generation)]["string"])
+    errors = list(data[(data["chain"] == chain) & (data["generation"] == generation)]["error"])
+    transitions = td[(td["chain"] == chain) & (td["generation"] == generation)]
+    sentences = []
+    word_lengths = {}
+    within_TPs = []
+    across_TPs = []
+    
+    for i in range(len(strings)):
+        ts = list(transitions[transitions["sentence_number"] == i]["transition_probability"])
+        words = []
+        word = str(strings[i])[0:(n-1)]
+        last_tp = 0
+        for j in range(len(ts)):
+            if ts[j] < last_tp * cutoff_ratio:
+                words.append(word)
+                word_lengths[word]=len(word)
+                word = ''
+                across_TPs.append(ts[j])
+            else:
+                within_TPs.append(ts[j])
+            word += str(strings[i])[j+(n-1)]
+            last_tp = ts[j]
+        words.append(word)
+        word_lengths[word]=len(word)
+        sentences.append((words,errors[i]))
+    return sentences, word_lengths.values(), within_TPs, across_TPs
+
+
+```
+
+## Make a new data frame with words instead of characters
+
+First step is to build the transition probabilities
+
+```{python}
+td = transition_data_frame(data, 3)
+
+```
+
+```{python}
+r_df = ratios_df(data, td, 3)
+```
+
+```{python}
+sns.histplot(r_df[r_df["generation"]==0]["ratio"])
+
+plt.tight_layout(pad=3)
+plt.show()
+plt.clf()
+```
+
+```{python}
+def percentile(data_points, alpha):
+    return sorted(list(data_points))[int(len(data_points)*alpha)]
+```
+
+Now build a new data frame with the cut up sequences of words in it based on the five percent lowest TP-ratios in the generation 0 data.
+
+**Remember that the n parameter here needs to match the one that build the transition probabilities!**
+
+```{python}
+def build_new_data(data, td, n, cutoff_ratio):
+    data_dict={'generation':[], 'chain':[], 'string':[], 'length':[], 'error':[]}
+    data_lengths_dict={'generation':[], 'chain':[], 'word_length':[]}
+    data_within_TPs_dict={'generation':[], 'chain':[], 'transition_probability':[], 'type':[]}
+    data_across_TPs_dict={'generation':[], 'chain':[], 'transition_probability':[], 'type':[]}
+    for g in set(data["generation"]):
+        for c in set(data["chain"]):
+            new_strings, word_lengths, within_TPs, across_TPs = cut_sequences_sliding(data, td, g, c, n, cutoff_ratio)
+            for s, e in new_strings:
+                data_dict['generation'].append(g)
+                data_dict['chain'].append(c)
+                data_dict['string'].append(s)
+                data_dict['length'].append(len(s))
+                data_dict['error'].append(e)
+            for l in word_lengths:
+                data_lengths_dict['generation'].append(g)
+                data_lengths_dict['chain'].append(c)
+                data_lengths_dict['word_length'].append(l)
+            for w in within_TPs:
+                data_within_TPs_dict['generation'].append(g)
+                data_within_TPs_dict['chain'].append(c)
+                data_within_TPs_dict['transition_probability'].append(w)
+                data_within_TPs_dict['type'].append('within')
+            for a in across_TPs:
+                data_across_TPs_dict['generation'].append(g)
+                data_across_TPs_dict['chain'].append(c)
+                data_across_TPs_dict['transition_probability'].append(a)
+                data_across_TPs_dict['type'].append('between')
+                
+    return pd.DataFrame.from_dict(data_dict), pd.DataFrame.from_dict(data_lengths_dict), pd.DataFrame.from_dict(data_within_TPs_dict), pd.DataFrame.from_dict(data_across_TPs_dict)
+
+```
+
+```{python}
+five_percent_tail = percentile(r_df[r_df["generation"]==0]["ratio"], 0.05)
+print(five_percent_tail)
+new_data, lengths, within_TPs, across_TPs = build_new_data(data, td, 3, five_percent_tail)
+
+```
+
+```{python}
+
+transition_probabilities = pd.concat([within_TPs, across_TPs])
+```
+
+```{python}
+sns.lineplot(transition_probabilities, x="generation", y="transition_probability", hue='type', err_style="bars")
+
+plt.ylabel("transition probability")
+
+plt.tight_layout(pad=3)
+plt.show()
+plt.savefig("probabilities.png")
+plt.clf()
+```
+
+```{r, warning=FALSE}
+library(lme4)
+library(lmerTest)
+
+model <- lmer(data=py$transition_probabilities, transition_probability ~ generation * type + (1+generation|chain))
+
+summary(model)
+```
+
+The words get shorter over generations.
+
+```{python}
+sns.lineplot(lengths, x="generation", y="word_length", err_style="bars")
+plt.ylabel("word length")
+
+plt.tight_layout(pad=3)
+plt.show()
+plt.savefig("lengths.png")
+plt.clf()
+```
+
+```{r warning=FALSE}
+library(lme4)
+library(lmerTest)
+
+model <- lmer(data=subset(py$lengths, generation!=0), word_length ~ generation + (1+generation|chain), control=lmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+
+model2 <- lmer(data=py$lengths, word_length ~ generation + (1+generation|chain), control=lmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+summary(model)
+summary(model2)
+```
+
+## Emergence of zipfian distribution
+
+If we plot now the frequency distribution of the cut up words, we see clear zipfian distribution emerging.
+
+```{python}
+new_ranked_freq = ranked_ngram_frequencies(new_data, 1)
+```
+
+```{python}
+g = sns.FacetGrid(new_ranked_freq, col="generation", col_wrap=4)
+g.map_dataframe(sns.lineplot, x="rank", y="count")
+
+plt.tight_layout(pad=3)
+plt.show()
+plt.savefig("zipf.png")
+plt.clf()
+```
+
+```{python}
+g = sns.FacetGrid(new_ranked_freq, col="generation", col_wrap=4)
+g.map_dataframe(sns.lineplot, x="log_rank", y="log_count")
+
+plt.tight_layout(pad=3)
+plt.show()
+plt.savefig("zipflog.png")
+plt.clf()
+```
+```{python}
+f, axes = plt.subplots(1, 2)
+
+sns.lineplot(new_ranked_freq[new_ranked_freq['generation']==10], x="rank", y="count", ax=axes[0])
+sns.lineplot(new_ranked_freq[new_ranked_freq['generation']==10], x="log_rank", y="log_count", ax=axes[1])
+
+plt.tight_layout(pad=3)
+plt.show()
+plt.savefig("zipffinal.png")
+plt.clf()
+
+```
+## How well do the frequency distributions fit a power law?
+
+We can calculate the correlation between the log frequency and log rank and plot $R^2$
+
+```{python}
+
+import scipy.stats
+
+generations = list(set(new_ranked_freq["generation"]))
+chains = list(set(new_ranked_freq["chain"]))
+data_dict = {'generation':[], 'chain':[], 'correlation_coefficient':[], 'r2':[]}
+for c in chains:
+    for g in generations[1:]:
+        ranks = new_ranked_freq[(new_ranked_freq['generation']==g)&(new_ranked_freq['chain']==c)]['log_rank']
+        counts = new_ranked_freq[(new_ranked_freq['generation']==g)&(new_ranked_freq['chain']==c)]['log_count']
+        r = scipy.stats.pearsonr(ranks, counts)[0]
+        r2 = r ** 2
+        data_dict['generation'].append(g)
+        data_dict['chain'].append(c)
+        data_dict['correlation_coefficient'].append(r)
+        data_dict['r2'].append(r2)
+
+correlations = pd.DataFrame.from_dict(data_dict)    
+```
+
+```{python}
+sns.lineplot(correlations, x="generation", y="r2", err_style="bars")
+plt.ylabel("$R^2$")
+plt.tight_layout(pad=3)
+plt.show()
+plt.savefig("r2.png")
+plt.clf()
+```
+
+```{r warning=FALSE}
+library(lme4)
+library(lmerTest)
+
+model <- lmer(data=py$correlations, r2 ~ generation + (1+generation|chain))
+
+summary(model)
+```
+
+
+## Analysis of entropy over words
+
+```{python}
+entropies = ngram_entropies(new_data, 1)
+```
+
+Entropy (now calculated on words) decreases.
+
+
+```{python}
+sns.lineplot(entropies, x="generation", y="ngram_entropy", err_style="bars")
+
+plt.ylabel("entropy")
+plt.tight_layout(pad=3)
+plt.show()
+plt.savefig("entropy.png")
+plt.clf()
+```
+Because entropy also depends on number of words we control for this as a fixed effect. (Singular fit with more complex random effect.)
+
+```{r, warning=FALSE}
+library(lme4)
+library(lmerTest)
+
+model <- lmer(data=py$entropies, ngram_entropy ~ generation + ngram_count + (1|chain))
+summary(model)
+```
+
+## Does entropy over words relate to learnability?
+
+We can plot entropy of the words against the average error in recalling the sequences. Very strong correlation!
+
+```{python}
+sns.lmplot(entropies, x="ngram_entropy", y="error")
+plt.xlabel("entropy")
+
+plt.tight_layout(pad=3)
+plt.show()
+plt.savefig("entropy_error.png")
+plt.clf()
+```
+
+```{r warning=FALSE}
+cor.test(py$entropies$ngram_entropy, py$entropies$error)
+```
+
