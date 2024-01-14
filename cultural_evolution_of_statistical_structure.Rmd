@@ -48,7 +48,7 @@ Very clear decrease in error.
 library(lme4)
 library(lmerTest)
 
-model <- lmer(data=py$data, error ~ generation + (1+generation|chain))
+model <- lmer(data=py$data, error ~ generation + (1+generation|chain) + (1|sentence_number))
 summary(model)
 ```
 
