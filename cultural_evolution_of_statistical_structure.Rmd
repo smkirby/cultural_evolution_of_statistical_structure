@@ -28,7 +28,8 @@ plt.tight_layout(pad=3)
 
 ```{python}
 data = pd.read_csv("simon_game_data.csv")
-data["sentence_number"] = list(range(60))*66
+data["sentence_number"] = [str(x) for x in list(range(60))*66]
+data["sentence_id"] = data["chain"] + data["sentence_number"]
 data
 ```
 
@@ -48,7 +49,7 @@ Very clear decrease in error.
 library(lme4)
 library(lmerTest)
 
-model <- lmer(data=py$data, error ~ generation + (1+generation|chain) + (1|sentence_number))
+model <- lmer(data=py$data, error ~ generation + (1+generation|chain) + (1|sentence_id))
 summary(model)
 ```
 
@@ -112,13 +113,15 @@ This is mainly to process characters into TPs between characters, for using to s
 ```{python}
 def transition_data(data, generation, chain, n):
     ngrams = ngram_table(data, generation, chain, n)
+    ngrams_sum = sum(ngrams.values())
     smaller_grams = ngram_table(data, generation, chain, n - 1)
+    smaller_grams_sum = sum(smaller_grams.values())
     strings = data[(data["chain"] == chain) & (data["generation"] == generation)]["string"]
     transitions_list = []
     for string in strings:
         transitions = []
         for i in range(len(string) - (n - 1)):
-            transitions.append(ngrams[string[i:i+n]] / smaller_grams[string[i:i+(n-1)]])
+            transitions.append((ngrams[string[i:i+n]]/ngrams_sum) / (smaller_grams[string[i:i+(n-1)]]/smaller_grams_sum))
         transitions_list.append(transitions)
     return transitions_list
 
