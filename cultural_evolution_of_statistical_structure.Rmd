@@ -323,7 +323,7 @@ The words get shorter over generations.
 
 ```{python}
 sns.lineplot(lengths, x="generation", y="word_length", err_style="bars")
-plt.ylabel("word length")
+plt.ylabel("unit length")
 
 plt.tight_layout(pad=3)
 plt.show()
